@@ -9,7 +9,7 @@ import optuna
 import pandas as pd
 from optuna.samplers import TPESampler
 from sklearn.base import clone
-from sklearn.metrics import roc_auc_score
+from sklearn.metrics import roc_auc_score, accuracy_score, f1_score
 from sklearn.model_selection import StratifiedKFold
 from sklearn.pipeline import Pipeline
 
@@ -22,10 +22,6 @@ optuna.logging.set_verbosity(optuna.logging.WARNING)
 
 
 def _suggest_params(trial: optuna.Trial, model_name: str) -> dict[str, Any]:
-    """
-    Generuje hiperparametry dla danego modelu na podstawie przestrzeni
-    zdefiniowanej w models.py.
-    """
     param_space = get_param_space(model_name)
     params: dict[str, Any] = {}
 
@@ -60,12 +56,6 @@ def _suggest_params(trial: optuna.Trial, model_name: str) -> dict[str, Any]:
 
 
 def _predict_scores(model: Pipeline, X: pd.DataFrame) -> np.ndarray:
-    """
-    Zwraca score/probability do ROC-AUC.
-    Priorytet:
-    1. predict_proba[:, 1]
-    2. decision_function
-    """
     if hasattr(model, "predict_proba"):
         return model.predict_proba(X)[:, 1]
 
@@ -86,16 +76,16 @@ def _predict_scores(model: Pipeline, X: pd.DataFrame) -> np.ndarray:
     )
 
 
+def _predict_classes(model: Pipeline, X: pd.DataFrame) -> np.ndarray:
+    return model.predict(X)
+
+
 def _build_full_pipeline(
     model_name: str,
     model_params: dict[str, Any],
     impute_strategy: str,
     n_features: int,
 ) -> Pipeline:
-    """
-    Buduje pełny pipeline:
-    preprocessing + classifier
-    """
     base_model = clone(get_models()[model_name])
     model = base_model.set_params(**model_params)
 
@@ -121,10 +111,6 @@ def _objective(
     model_name: str,
     impute_strategy: str,
 ) -> float:
-    """
-    Funkcja celu dla Optuna.
-    Optymalizuje średni ROC-AUC w inner CV.
-    """
     model_params = _suggest_params(trial, model_name)
 
     inner_cv = StratifiedKFold(
@@ -150,31 +136,25 @@ def _objective(
 
         pipeline.fit(X_tr, y_tr)
         y_scores = _predict_scores(pipeline, X_val)
-        fold_score = roc_auc_score(y_val, y_scores)
-        scores.append(fold_score)
+        scores.append(roc_auc_score(y_val, y_scores))
 
-    mean_score = float(np.mean(scores))
-    return mean_score
+    return float(np.mean(scores))
 
 
 def run_nested_cv(X: pd.DataFrame, y: pd.Series, model_name: str) -> dict[str, Any]:
-    """
-    Uruchamia nested cross-validation dla jednego modelu:
-    - outer CV: uczciwa ocena
-    - inner CV + Optuna: tuning hiperparametrów
-
-    Zwraca słownik z podsumowaniem wyników.
-    """
     outer_cv = StratifiedKFold(
         n_splits=config.outer_cv,
         shuffle=True,
         random_state=config.random_state,
     )
 
-    outer_scores: list[float] = []
-    chosen_imputations: list[str] = []
-    fold_details: list[dict[str, Any]] = []
-    fitted_pipelines: list[Pipeline] = []
+    outer_roc_scores = []
+    outer_acc_scores = []
+    outer_f1_scores = []
+
+    chosen_imputations = []
+    fold_details = []
+    fitted_pipelines = []
 
     for fold_idx, (train_idx, test_idx) in enumerate(outer_cv.split(X, y), start=1):
         X_train = X.iloc[train_idx]
@@ -184,7 +164,7 @@ def run_nested_cv(X: pd.DataFrame, y: pd.Series, model_name: str) -> dict[str, A
 
         best_inner_score = -np.inf
         best_impute_strategy = None
-        best_params: dict[str, Any] | None = None
+        best_params = None
 
         print(f"\n[Model: {model_name}] Outer fold {fold_idx}/{config.outer_cv}")
 
@@ -198,11 +178,11 @@ def run_nested_cv(X: pd.DataFrame, y: pd.Series, model_name: str) -> dict[str, A
 
             study.optimize(
                 lambda trial: _objective(
-                    trial=trial,
-                    X_train=X_train,
-                    y_train=y_train,
-                    model_name=model_name,
-                    impute_strategy=strategy,
+                    trial,
+                    X_train,
+                    y_train,
+                    model_name,
+                    strategy,
                 ),
                 n_trials=config.n_trials,
                 show_progress_bar=False,
@@ -213,9 +193,6 @@ def run_nested_cv(X: pd.DataFrame, y: pd.Series, model_name: str) -> dict[str, A
                 best_impute_strategy = strategy
                 best_params = study.best_params
 
-        if best_impute_strategy is None or best_params is None:
-            raise RuntimeError("Nie udało się znaleźć najlepszej konfiguracji.")
-
         best_pipeline = _build_full_pipeline(
             model_name=model_name,
             model_params=best_params,
@@ -224,17 +201,27 @@ def run_nested_cv(X: pd.DataFrame, y: pd.Series, model_name: str) -> dict[str, A
         )
 
         best_pipeline.fit(X_train, y_train)
-        y_scores = _predict_scores(best_pipeline, X_test)
-        outer_score = float(roc_auc_score(y_test, y_scores))
 
-        outer_scores.append(outer_score)
+        y_scores = _predict_scores(best_pipeline, X_test)
+        y_pred = _predict_classes(best_pipeline, X_test)
+
+        outer_roc = float(roc_auc_score(y_test, y_scores))
+        outer_acc = float(accuracy_score(y_test, y_pred))
+        outer_f1 = float(f1_score(y_test, y_pred))
+
+        outer_roc_scores.append(outer_roc)
+        outer_acc_scores.append(outer_acc)
+        outer_f1_scores.append(outer_f1)
+
         chosen_imputations.append(best_impute_strategy)
         fitted_pipelines.append(best_pipeline)
 
         fold_details.append(
             {
                 "fold": fold_idx,
-                "outer_roc_auc": outer_score,
+                "accuracy": outer_acc,
+                "f1_score": outer_f1,
+                "outer_roc_auc": outer_roc,
                 "best_inner_roc_auc": best_inner_score,
                 "best_impute_strategy": best_impute_strategy,
                 "best_params": best_params,
@@ -242,15 +229,23 @@ def run_nested_cv(X: pd.DataFrame, y: pd.Series, model_name: str) -> dict[str, A
         )
 
         print(
-            f"  Fold result | inner ROC-AUC: {best_inner_score:.4f} "
-            f"| test ROC-AUC: {outer_score:.4f} "
-            f"| imputacja: {best_impute_strategy}"
+            f"  Fold result | "
+            f"ACC: {outer_acc:.4f} | "
+            f"F1: {outer_f1:.4f} | "
+            f"ROC-AUC: {outer_roc:.4f} | "
+            f"imputacja: {best_impute_strategy}"
         )
 
-    mean_score = float(np.mean(outer_scores))
-    std_score = float(np.std(outer_scores))
+    roc_mean = float(np.mean(outer_roc_scores))
+    roc_std = float(np.std(outer_roc_scores))
 
-    best_fold_index = int(np.argmax(outer_scores))
+    acc_mean = float(np.mean(outer_acc_scores))
+    acc_std = float(np.std(outer_acc_scores))
+
+    f1_mean = float(np.mean(outer_f1_scores))
+    f1_std = float(np.std(outer_f1_scores))
+
+    best_fold_index = int(np.argmax(outer_roc_scores))
     best_pipeline = fitted_pipelines[best_fold_index]
 
     model_dir = Path("results/best_models")
@@ -269,8 +264,12 @@ def run_nested_cv(X: pd.DataFrame, y: pd.Series, model_name: str) -> dict[str, A
 
     return {
         "model": model_name,
-        "roc_auc_mean": mean_score,
-        "roc_auc_std": std_score,
+        "accuracy_mean": acc_mean,
+        "accuracy_std": acc_std,
+        "f1_mean": f1_mean,
+        "f1_std": f1_std,
+        "roc_auc_mean": roc_mean,
+        "roc_auc_std": roc_std,
         "best_impute_strategy": best_imputation_overall,
         "best_model_path": str(model_path),
         "fold_details_json_path": str(json_path),
@@ -286,5 +285,3 @@ if __name__ == "__main__":
 
     result = run_nested_cv(X, y, "LogisticRegression")
     print(result)
-
-
